@@ -13,7 +13,7 @@ from typing import Callable
 
 import customtkinter as ctk
 
-from ..installer import create_venv, pip_install, npm_install, run_db_migration, create_local_database
+from ..installer import create_venv, pip_install, npm_install, run_db_migration, create_local_database, wait_for_hindsight
 from ..env_writer import write_env
 from ..screens.database import DatabaseConfig
 from ..screens.hindsight import HindsightConfig
@@ -74,13 +74,14 @@ class InstallScreen(ctk.CTkFrame):
 
         self._steps: dict[str, ProgressRow] = {}
         step_defs = [
-            ("env",     "Write .env configuration file"),
-            ("venv",    "Create Python virtual environment"),
-            ("pip",     "Install Python packages"),
-            ("npm",     "Install dashboard packages (npm)"),
-            ("db",      "Set up database"),
-            ("migrate", "Run database migrations"),
-            ("memory",  "Seed initial memory & heartbeat config"),
+            ("env",       "Write .env configuration file"),
+            ("venv",      "Create Python virtual environment"),
+            ("pip",       "Install Python packages"),
+            ("npm",       "Install dashboard packages (npm)"),
+            ("db",        "Set up database"),
+            ("migrate",   "Run database migrations"),
+            ("memory",    "Seed initial memory & heartbeat config"),
+            ("hindsight", "Verify Hindsight connection"),
         ]
         for i, (step_id, label) in enumerate(step_defs):
             row = ProgressRow(steps_frame, label)
@@ -340,6 +341,29 @@ class InstallScreen(ctk.CTkFrame):
             memory_ok = False
         self._set_step_done("memory", ok=memory_ok)
 
+        # ── Step 8: Verify Hindsight connection (if enabled) ─────────────────
+        if self._hindsight_config.enabled:
+            self._set_step("hindsight", 0.1, "Checking…")
+            last_msg = ""
+            for msg, progress in wait_for_hindsight():
+                self._log_line(msg)
+                self._set_step("hindsight", progress * 0.9, "")
+                last_msg = msg
+            if "ERROR" in last_msg.upper():
+                self._log_line(
+                    "WARNING: Hindsight is not responding. The agent will run without episodic memory."
+                )
+                self._log_line(
+                    "To fix: ensure Docker Desktop is running and the 'hindsight' container is started."
+                )
+                self._set_step_warning("hindsight")
+                # Intentionally does NOT set success = False — Hindsight is optional.
+            else:
+                self._set_step_done("hindsight", ok=True)
+        else:
+            self._log_line("Hindsight not configured — skipping connection check.")
+            self._set_step_done("hindsight", ok=True)
+
         # ── Done ──────────────────────────────────────────────────────────────
         self._running = False
         self._done = True
@@ -387,6 +411,9 @@ class InstallScreen(ctk.CTkFrame):
 
     def _set_step_done(self, step_id: str, ok: bool) -> None:
         self.after(0, lambda: self._steps[step_id].set_done(ok))
+
+    def _set_step_warning(self, step_id: str) -> None:
+        self.after(0, lambda: self._steps[step_id].set_warning())
 
     def _log_line(self, msg: str) -> None:
         self.after(0, lambda: self._log.append(msg))

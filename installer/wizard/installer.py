@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -123,6 +124,40 @@ def wait_for_docker_daemon(timeout_seconds: int = 120) -> Generator[tuple[str, f
     yield "ERROR: Docker daemon did not start within the timeout. Please start Docker Desktop manually.", 1.0
 
 
+def wait_for_hindsight(
+    url: str = "http://localhost:8888",
+    timeout: int = 60,
+    interval: int = 2,
+) -> Generator[tuple[str, float], None, None]:
+    """Poll url until any HTTP response is received (server is alive) or timeout.
+
+    Any HTTP response — even 4xx — means the server is listening. Only a
+    connection error (refused/reset) means it is not yet ready. Yields
+    (message, progress) ticks so the caller can show live feedback.
+    """
+    yield "Waiting for Hindsight API to become ready…", 0.0
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            urllib.request.urlopen(url, timeout=2)
+            yield "Hindsight API is responding.", 1.0
+            return
+        except urllib.error.HTTPError:
+            # Got an HTTP error response — server is listening, that's enough.
+            yield "Hindsight API is responding.", 1.0
+            return
+        except (urllib.error.URLError, ConnectionError, OSError):
+            # Connection refused / reset — server not yet up, keep polling.
+            pass
+        elapsed = time.time() - start
+        yield f"Waiting for Hindsight API… ({int(elapsed)}s)", elapsed / timeout
+        time.sleep(interval)
+    yield (
+        f"ERROR: Hindsight API did not respond within {timeout}s. "
+        "The container may have failed to start or is taking longer than usual."
+    ), 1.0
+
+
 # ── Hindsight Docker image ────────────────────────────────────────────────────
 
 HINDSIGHT_IMAGE = "ghcr.io/vectorize-io/hindsight:latest"
@@ -212,10 +247,22 @@ def start_hindsight_container(
         HINDSIGHT_IMAGE,
     ]
 
+    error_detected = False
     for line, is_err in _run_stream(cmd, timeout=60):
         yield line, 0.5
+        if is_err:
+            error_detected = True
 
-    yield "Hindsight container started. API: http://localhost:8888  UI: http://localhost:9999", 1.0
+    if error_detected:
+        yield "ERROR: Failed to start Hindsight container. See log above.", 1.0
+        return
+
+    for msg, progress in wait_for_hindsight():
+        yield msg, 0.6 + progress * 0.4
+
+    # Success message is only reached if wait_for_hindsight did not yield an ERROR.
+    # The caller checks "ERROR" in msg.upper() to detect failure — consistent with
+    # how install.py handles errors from create_venv, pip_install, etc.
 
 
 # ── PostgreSQL local setup ────────────────────────────────────────────────────

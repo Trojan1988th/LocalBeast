@@ -155,3 +155,9 @@ class ProgressRow(ctk.CTkFrame):
         else:
             self._bar.configure(progress_color=COLOR_RED)
             self._status.configure(text="Failed", text_color=COLOR_RED)
+
+    def set_warning(self) -> None:
+        """Mark this step complete with a non-blocking warning (yellow)."""
+        self._bar.set(1.0)
+        self._bar.configure(progress_color=COLOR_YELLOW)
+        self._status.configure(text="Warning", text_color=COLOR_YELLOW)

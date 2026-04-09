@@ -444,6 +444,7 @@ class EnvConfigScreen(ctk.CTkFrame):
         if self._hindsight_config.enabled:
             values["HINDSIGHT_BASE_URL"] = "http://localhost:8888"
             values["HINDSIGHT_BANK_ID"] = self._hindsight_config.bank_id
+            values["HINDSIGHT_USER_ID"] = "default"
             values["HINDSIGHT_ENABLED"] = "true"
             if self._hindsight_config.llm_api_key:
                 values["HINDSIGHT_API_LLM_PROVIDER"] = self._hindsight_config.llm_provider

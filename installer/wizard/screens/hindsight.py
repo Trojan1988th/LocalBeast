@@ -24,7 +24,7 @@ import customtkinter as ctk
 from ..detector import detect_docker, detect_hindsight, HindsightState, SystemSnapshot
 from ..installer import (
     pull_hindsight_image, start_hindsight_container, wait_for_docker_daemon,
-    HINDSIGHT_IMAGE, HINDSIGHT_CONTAINER,
+    wait_for_hindsight, HINDSIGHT_IMAGE, HINDSIGHT_CONTAINER,
 )
 from ..theme import (
     FONT_HEADING, FONT_BODY, FONT_SMALL,
@@ -362,19 +362,38 @@ class HindsightScreen(ctk.CTkFrame):
         self._log.grid()
 
         def run():
+            # Ensure the Docker daemon is ready before issuing docker start.
+            for msg, _ in wait_for_docker_daemon(timeout_seconds=30):
+                self.after(0, lambda m=msg: self._log.append(m))
+                if msg.startswith("ERROR"):
+                    self.after(0, lambda: self._action_btn.configure(text="Retry", state="normal"))
+                    return
+
             self.after(0, lambda: self._log.append("Starting Hindsight container…"))
             rc = subprocess.run(
                 ["docker", "start", HINDSIGHT_CONTAINER],
                 capture_output=True, text=True,
                 creationflags=_NO_WINDOW,
             )
-            if rc.returncode == 0:
+            if rc.returncode != 0:
+                err = rc.stderr.strip() or rc.stdout.strip()
                 self.after(0, lambda: (
-                    self._log.append("Container started successfully."),
-                    self._log.append("Waiting for API to become available…"),
+                    self._log.append(f"ERROR starting container: {err}"),
+                    self._action_btn.configure(text="Retry", state="normal"),
                 ))
-                # Give it a few seconds to come up
-                time.sleep(5)
+                return
+
+            self.after(0, lambda: self._log.append("Container started successfully."))
+
+            # Poll until the API is actually responding — replaces the unreliable time.sleep(5).
+            api_ready = True
+            for msg, _ in wait_for_hindsight():
+                self.after(0, lambda m=msg: self._log.append(m))
+                if "ERROR" in msg.upper():
+                    api_ready = False
+
+            if api_ready:
+                self._pull_done = True
                 self.after(0, lambda: (
                     self._status_icon_lbl.configure(text="✓", text_color=COLOR_GREEN),
                     self._status_text_lbl.configure(
@@ -382,13 +401,14 @@ class HindsightScreen(ctk.CTkFrame):
                         text_color=COLOR_GREEN,
                     ),
                     self._action_btn.configure(text="Running ✓", state="disabled"),
-                    self._log.append("Hindsight is ready."),
                 ))
-                self._pull_done = True
             else:
-                err = rc.stderr.strip() or rc.stdout.strip()
                 self.after(0, lambda: (
-                    self._log.append(f"ERROR starting container: {err}"),
+                    self._status_icon_lbl.configure(text="✗", text_color=COLOR_RED),
+                    self._status_text_lbl.configure(
+                        text="Container started but API is not responding. Check Docker logs.",
+                        text_color=COLOR_RED,
+                    ),
                     self._action_btn.configure(text="Retry", state="normal"),
                 ))
 
@@ -400,6 +420,13 @@ class HindsightScreen(ctk.CTkFrame):
         self._log.grid()
 
         def run():
+            # Ensure the Docker daemon is ready before issuing docker run.
+            for msg, _ in wait_for_docker_daemon(timeout_seconds=30):
+                self.after(0, lambda m=msg: self._log.append(m))
+                if msg.startswith("ERROR"):
+                    self.after(0, lambda: self._action_btn.configure(text="Create Container", state="normal"))
+                    return
+
             base_url = self._llm_base_url.get().strip() or "https://api.openai.com/v1"
             model    = self._llm_model.get().strip() or "gpt-4o-mini"
             api_key  = self._llm_api_key.get().strip()
@@ -411,6 +438,7 @@ class HindsightScreen(ctk.CTkFrame):
                 ))
                 return
 
+            container_ok = True
             for msg, _ in start_hindsight_container(
                 llm_provider="openai",
                 llm_base_url=base_url,
@@ -418,16 +446,28 @@ class HindsightScreen(ctk.CTkFrame):
                 llm_api_key=api_key,
             ):
                 self.after(0, lambda m=msg: self._log.append(m))
+                if "ERROR" in msg.upper():
+                    container_ok = False
 
-            self._pull_done = True
-            self.after(0, lambda: (
-                self._status_icon_lbl.configure(text="✓", text_color=COLOR_GREEN),
-                self._status_text_lbl.configure(
-                    text="Hindsight container created and running. Set your Bank ID and continue.",
-                    text_color=COLOR_GREEN,
-                ),
-                self._action_btn.configure(text="Running ✓", state="disabled"),
-            ))
+            if container_ok:
+                self._pull_done = True
+                self.after(0, lambda: (
+                    self._status_icon_lbl.configure(text="✓", text_color=COLOR_GREEN),
+                    self._status_text_lbl.configure(
+                        text="Hindsight container created and running. Set your Bank ID and continue.",
+                        text_color=COLOR_GREEN,
+                    ),
+                    self._action_btn.configure(text="Running ✓", state="disabled"),
+                ))
+            else:
+                self.after(0, lambda: (
+                    self._status_icon_lbl.configure(text="✗", text_color=COLOR_RED),
+                    self._status_text_lbl.configure(
+                        text="Container setup failed. Check log above.",
+                        text_color=COLOR_RED,
+                    ),
+                    self._action_btn.configure(text="Retry", state="normal"),
+                ))
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -459,40 +499,64 @@ class HindsightScreen(ctk.CTkFrame):
         self._start_elapsed_timer()
 
         def run():
-            for msg, progress in pull_hindsight_image():
-                self.after(0, lambda m=msg, p=progress: (
-                    self._log.append(m),
-                    self._progress_bar.set(p),
-                    self._progress_label.configure(text=m[:100] if m else ""),
+            try:
+                for msg, progress in pull_hindsight_image():
+                    self.after(0, lambda m=msg, p=progress: (
+                        self._log.append(m),
+                        self._progress_bar.set(p),
+                        self._progress_label.configure(text=m[:100] if m else ""),
+                    ))
+
+                # Create container
+                base_url = self._llm_base_url.get().strip() or "https://api.openai.com/v1"
+                model    = self._llm_model.get().strip() or "gpt-4o-mini"
+                key      = self._llm_api_key.get().strip()
+                container_ok = True
+                for msg, _ in start_hindsight_container(
+                    llm_provider="openai",
+                    llm_base_url=base_url,
+                    llm_model=model,
+                    llm_api_key=key,
+                ):
+                    self.after(0, lambda m=msg: self._log.append(m))
+                    if "ERROR" in msg.upper():
+                        container_ok = False
+            except Exception as exc:
+                container_ok = False
+                self.after(0, lambda e=str(exc): self._log.append(f"ERROR: Unexpected failure: {e}"))
+            finally:
+                # Always reset _pull_running so the elapsed timer stops and the
+                # button can be re-enabled — even if an unexpected exception occurs.
+                self._pull_running = False
+
+            if container_ok:
+                self._pull_done = True
+                self.after(0, lambda: (
+                    self._progress_bar.set(1.0),
+                    self._progress_bar.configure(progress_color=COLOR_GREEN),
+                    self._progress_label.configure(
+                        text="Hindsight downloaded and started!", text_color=COLOR_GREEN
+                    ),
+                    self._action_btn.configure(text="Done ✓", state="disabled"),
+                    self._status_icon_lbl.configure(text="✓", text_color=COLOR_GREEN),
+                    self._status_text_lbl.configure(
+                        text="Hindsight is ready. Set your Bank ID and continue.",
+                        text_color=COLOR_GREEN,
+                    ),
                 ))
-
-            # Create container
-            base_url = self._llm_base_url.get().strip() or "https://api.openai.com/v1"
-            model    = self._llm_model.get().strip() or "gpt-4o-mini"
-            key      = self._llm_api_key.get().strip()
-            for msg, _ in start_hindsight_container(
-                llm_provider="openai",
-                llm_base_url=base_url,
-                llm_model=model,
-                llm_api_key=key,
-            ):
-                self.after(0, lambda m=msg: self._log.append(m))
-
-            self._pull_running = False
-            self._pull_done = True
-            self.after(0, lambda: (
-                self._progress_bar.set(1.0),
-                self._progress_bar.configure(progress_color=COLOR_GREEN),
-                self._progress_label.configure(
-                    text="Hindsight downloaded and started!", text_color=COLOR_GREEN
-                ),
-                self._action_btn.configure(text="Done ✓", state="disabled"),
-                self._status_icon_lbl.configure(text="✓", text_color=COLOR_GREEN),
-                self._status_text_lbl.configure(
-                    text="Hindsight is ready. Set your Bank ID and continue.",
-                    text_color=COLOR_GREEN,
-                ),
-            ))
+            else:
+                self.after(0, lambda: (
+                    self._progress_bar.configure(progress_color=COLOR_RED),
+                    self._progress_label.configure(
+                        text="Container failed to start. Check log above.", text_color=COLOR_RED
+                    ),
+                    self._action_btn.configure(text="Retry", state="normal"),
+                    self._status_icon_lbl.configure(text="✗", text_color=COLOR_RED),
+                    self._status_text_lbl.configure(
+                        text="Hindsight container did not start. Check Docker logs.",
+                        text_color=COLOR_RED,
+                    ),
+                ))
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -536,6 +600,16 @@ class HindsightScreen(ctk.CTkFrame):
         choice = self._choice.get()
         if choice == "skip":
             self._on_next(HindsightConfig(enabled=False))
+            return
+
+        # Guard: don't advance until Hindsight is confirmed running.
+        if not self._pull_done:
+            self._status_icon_lbl.configure(text="⚠", text_color=COLOR_RED)
+            self._status_text_lbl.configure(
+                text="Please complete Hindsight setup first (click the action button above), "
+                     "or choose 'Skip for now'.",
+                text_color=COLOR_RED,
+            )
             return
 
         config = HindsightConfig(
