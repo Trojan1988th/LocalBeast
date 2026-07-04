@@ -30,6 +30,7 @@ from langgraph.prebuilt import create_react_agent
 from .archival_tools import archival_query, archival_store
 from .daily_summary_tools import daily_summary_write
 from .notes_tools import notes_read, notes_create, notes_update, notes_search
+from .skills_tools import SKILLS_TOOLS
 from .clipboard_tools import CLIPBOARD_TOOLS
 from .conversation_search_tools import conversation_search
 from .discord_tools import discord_get_channel_info, discord_read_messages, discord_send_message, discord_send_file
@@ -373,6 +374,7 @@ TOOL_CATEGORIES = [
         notes_create,
         notes_update,
     ]),
+    ("Skills", SKILLS_TOOLS),
     ("Meta", [
         view_tools,
     ]),
@@ -791,6 +793,7 @@ def chat(
     channel_type: str | None = None,
     is_group_chat: bool = False,
     image_data_urls: list[str] | None = None,
+    ephemeral_context: str | None = None,
 ) -> dict:
     """
     Send a message and get a response, with full conversation history from Postgres.
@@ -845,7 +848,13 @@ def chat(
     # model responds to — the system prompt time is also there, but this is more salient.
     # The original user_message (without prefix) is what gets stored to DB and Hindsight.
     time_str = _format_current_time(current_time)
-    text_content = f"[{time_str}]\n{user_message}" if user_message else f"[{time_str}]\n[Image(s) attached]"
+    _user_block = user_message if user_message else "[Image(s) attached]"
+    if ephemeral_context and ephemeral_context.strip():
+        # Prompt-only context (e.g. voice-mode / read-aloud addendum): the LLM sees
+        # it this turn, but the stored message never includes it.
+        text_content = f"[{time_str}]\n\n{ephemeral_context.strip()}\n\n---\n\n{_user_block}"
+    else:
+        text_content = f"[{time_str}]\n{_user_block}"
 
     if image_data_urls:
         # Multimodal: text + images for vision-capable models

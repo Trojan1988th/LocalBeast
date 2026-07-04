@@ -1,0 +1,37 @@
+{
+  "_doc": "Agent Overlay settings reference (copy to settings.json, which is gitignored). Every key is optional — delete a key to restore its default. Full docs: E:/git/voice/RUNBOOK.md (Overlay section).",
+
+  "_doc_textThread": "Which thread TEXT messages target: 'voice' (realtime the agent, default) or 'main' (dashboard the agent). Voice turns always go to 'voice'. Snaps back to 'voice' when a voice session connects. Persisted automatically when toggled in the UI.",
+  "textThread": "voice",
+
+  "_doc_micDeviceId": "Explicit input device id for voice (from the ⚙ panel picker). null/absent = system default. Pick your headset mic explicitly when OBS is running.",
+  "micDeviceId": null,
+
+  "_doc_hotkeys": "Electron accelerator strings (no Shift anywhere — Sticky Keys). pttKey is a uiohook key NAME held to talk; pttMouseButton is a raw mouse button number (Razer paddle = 5; 0 disables the mouse path).",
+  "hotkeys": {
+    "pttKey": "F9",
+    "pttMouseButton": 5,
+    "showHide": "Ctrl+Alt+R",
+    "screenshot": "Ctrl+Alt+S",
+    "clickThrough": "Ctrl+Alt+C",
+    "voice": "Ctrl+Alt+V"
+  },
+
+  "_doc_readerAutoRead": "Reader (R4): auto-read replies on the MAIN-thread typed surface — the agent performs his replies aloud in his clone voice via the render service (port 5005). Persisted automatically when toggled in the UI (the 🔊 auto button above the input, visible on the main thread). The toggle click is also the audio-unlock gesture.",
+  "readerAutoRead": false,
+
+  "_doc_readerDeferToVoice": "Never-overlap rule: when a voice session is LIVE (connected/connecting — an errored attempt doesn't count), auto-read stays silent (true, default). Starting a voice session and pressing PTT always stop Reader playback regardless of this setting — the paddle always wins.",
+  "readerDeferToVoice": true,
+
+  "_doc_readerAutoReadCap": "Long-message consent: auto-read speaks only the first ~N chars of a long reply, stopping at a natural paragraph/sentence break, then shows 'continue reading ▸' on the message (the rest pre-renders quietly, so the click resumes instantly). 0 = always read everything. Per-message read-this always reads the full message.",
+  "readerAutoReadCap": 1500,
+
+  "_doc_screenshot": "Dual-image capture: context = full screen at contextWidth (JPEG jpegQuality), detail = cropW×cropH native-resolution PNG centered on the cursor. dualImage:false sends only the context image. Kimi limit: ≤4096×2160 per image.",
+  "screenshot": {
+    "dualImage": true,
+    "contextWidth": 1440,
+    "jpegQuality": 85,
+    "cropW": 800,
+    "cropH": 600
+  }
+}

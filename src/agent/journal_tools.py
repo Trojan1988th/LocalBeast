@@ -155,7 +155,7 @@ def save_journal_entry(
                             """
                             INSERT INTO journal_entries
                                 (entry_date, entry_type, title, content, word_count, source, created_at, updated_at)
-                            VALUES (%s, %s, %s, %s, %s, 'rowan', %s, %s)
+                            VALUES (%s, %s, %s, %s, %s, 'agent', %s, %s)
                             RETURNING id
                             """,
                             (edate, entry_type, title or "Daily Summary", content.strip(),
@@ -166,7 +166,7 @@ def save_journal_entry(
                         """
                         INSERT INTO journal_entries
                             (entry_date, entry_type, title, content, word_count, source, created_at, updated_at)
-                        VALUES (%s, %s, %s, %s, %s, 'rowan', %s, %s)
+                        VALUES (%s, %s, %s, %s, %s, 'agent', %s, %s)
                         RETURNING id
                         """,
                         (edate, entry_type, title or entry_type.title(), content.strip(),

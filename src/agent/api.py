@@ -1,5 +1,5 @@
 """
-FastAPI server for the the agent dashboard.
+FastAPI server for the agent dashboard.
 
 Local dev: Run API + Vite dev server (npm run dev in dashboard/). Open http://localhost:5173.
 Public (ngrok): Build dashboard (npm run build), run API, then ngrok http 8000. One URL serves both.
@@ -43,7 +43,7 @@ logging.basicConfig(
         ),
     ],
 )
-logger = logging.getLogger("rowan.api")
+logger = logging.getLogger("agent.api")
 
 from .core_memory import get_all_blocks, update_block, update_system_instructions
 from .cron_jobs import (
@@ -204,10 +204,26 @@ class ChatRequest(BaseModel):
     is_group_chat: bool = False
     image_data_urls: list[str] | None = None
     document_text: str | None = None  # Extracted text from PDF/DOCX/PPTX/TXT/MD
+    read_aloud: bool = False          # Reader: inject READ_ALOUD_ADDENDUM this turn
 
 
 class ChatResponse(BaseModel):
     response: str
+
+
+# Reader addendum — injected per-turn via chat()'s ephemeral_context when the
+# client's auto-read is on. Prompt-only, never persisted to thread history.
+# Mutually exclusive with voice mode per turn: voice turns come only through
+# /chat/stream (which injects VOICE_MODE_ADDENDUM and has no read_aloud flag).
+# Override the wording via READ_ALOUD_ADDENDUM in .env if you like.
+READ_ALOUD_ADDENDUM = os.environ.get("READ_ALOUD_ADDENDUM") or (
+    "[Read-aloud] The user is reading your reply while an expressive voice performs "
+    "it aloud. Be fully yourself — this is your normal written register, not clipped "
+    "voice mode. You may score your own delivery with [chuckle], [laugh], [sigh], "
+    "[gasp] where you would genuinely do those things — sparingly, as expression, "
+    "never decoration. Prefer prose over heavy formatting since your words will be "
+    "spoken as well as read."
+)
 
 
 class CoreMemoryBlock(BaseModel):
@@ -231,6 +247,7 @@ def _run_chat(
     is_group_chat: bool = False,
     image_data_urls: list[str] | None = None,
     document_text: str | None = None,
+    read_aloud: bool = False,
 ):
     """Run chat with optional images and document text."""
     full_message = (message or "").strip()
@@ -247,6 +264,7 @@ def _run_chat(
         channel_type=channel_type,
         is_group_chat=is_group_chat,
         image_data_urls=image_data_urls,
+        ephemeral_context=READ_ALOUD_ADDENDUM if read_aloud else None,
     )
 
 
@@ -264,6 +282,7 @@ def post_chat(req: ChatRequest):
             is_group_chat=req.is_group_chat,
             image_data_urls=req.image_data_urls,
             document_text=req.document_text,
+            read_aloud=req.read_aloud,
         )
     except RuntimeError as e:
         logger.error("POST /chat RuntimeError: %s", e)
@@ -1635,6 +1654,11 @@ def journal_delete(entry_id: int):
         raise HTTPException(status_code=404, detail="Entry not found")
     return {"success": True}
 
+
+# Voice mode: SSE streaming chat route — POST /api/chat/stream (+ arm-image).
+# All logic lives in voice_stream.py; this is the only api.py touchpoint.
+from .voice_stream import register_voice_stream_route  # noqa: E402
+register_voice_stream_route(api_router)
 
 # Mount API under /api (dashboard expects /api/chat, /api/messages, etc.)
 app.include_router(api_router, prefix="/api")

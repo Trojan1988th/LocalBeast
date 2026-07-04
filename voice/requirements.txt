@@ -1,0 +1,24 @@
+# Python 3.12 / Windows / RTX 4090 (driver CUDA 13.2)
+# torch pin dictated by chatterbox-tts 0.1.7 (torch==2.6.0); cu126 build verified for win_amd64 cp312.
+--extra-index-url https://download.pytorch.org/whl/cu126
+torch==2.6.0+cu126
+torchaudio==2.6.0+cu126
+chatterbox-tts==0.1.7
+# resemble-perth (chatterbox dep) imports pkg_resources, removed in setuptools>=81
+setuptools==80.9.0
+# STT (M2). ctranslate2 needs cuDNN 9 — provided by torch+cu126's bundled DLLs
+# (stt_smoke.py imports torch first for exactly this reason).
+faster-whisper==1.2.1
+sounddevice==0.5.5
+# Pipeline (M3). pipecat pulls numpy 2 + latest opencv by default, but chatterbox
+# genuinely breaks under numpy 2 (mel filterbank dtype error) — force 1.26.4 and
+# an opencv build that accepts it. `pip check` is clean with these.
+pipecat-ai[webrtc,silero,whisper]==1.4.0
+# UI served by pipecat.runner at /client (the small-webrtc-prebuilt package's UI
+# speaks a /start protocol the runner also provides; runner needs THIS package)
+pipecat-ai-prebuilt==1.0.3
+numpy==1.26.4
+opencv-python==4.10.0.84
+# the agent SSE client (M4) — both already transitive deps, pinned here as direct
+httpx==0.28.1
+python-dotenv==1.2.2

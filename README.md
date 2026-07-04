@@ -23,11 +23,22 @@ Most AI agents remember what you tell them to remember. This one builds an inner
 
 ## Gaming Overlay
 
-Chat with your agent while gaming — no alt-tab required. An always-on-top transparent Electron overlay sits above any full-screen app.
+Chat with your agent while gaming — no alt-tab required. An always-on-top transparent Electron overlay sits above any full-screen app. Now with **voice**: connect a realtime session, hold **F9 (or a mouse paddle) to talk**, get live captions, and an honest mic indicator that reads the actual track state. Dual-image screenshots (full-screen context + a cursor-centered detail crop) go straight to vision-capable models, and clipboard images paste right into the input with Ctrl+V.
 
-`Ctrl+Shift+R` show/hide · `Ctrl+Shift+S` screenshot · `Ctrl+Shift+C` click-through toggle
+`Ctrl+Alt+R` show/hide · `Ctrl+Alt+S` screenshot · `Ctrl+Alt+C` click-through · `Ctrl+Alt+V` voice connect · hold `F9` push-to-talk — all rebindable in `settings.json`
 
-See [electron-overlay/README.md](./electron-overlay/README.md) for more info.
+---
+
+## Voice: Realtime Conversation + The Reader (new)
+
+Two independent, fully local ways to *hear* your agent — in a voice **you provide** (no voice ships with this repo):
+
+- **Realtime voice** (`voice/voice_bot.py`): talk out loud, agent answers out loud. Pipecat pipeline — faster-whisper STT → the new SSE streaming route (`POST /api/chat/stream`) → Chatterbox-Turbo TTS cloned from your own ~10–30s reference recording. Barge-in works; pre-generated filler clips in your voice cover LLM latency; an optional half-duplex mode survives noisy rooms. A per-turn **voice-mode addendum** (prompt-only, never persisted) shapes replies for speech — override its wording via `VOICE_MODE_ADDENDUM` in `.env`.
+- **The Reader** (`voice/reader/`): the agent *performs* its written replies. With auto-read on, a **read-aloud addendum** lets it score its own delivery with `[chuckle]` / `[laugh]` / `[sigh]` tags, and an Orpheus 3B render service (llama.cpp, streamed WAV) performs them expressively. Stock voices work with zero setup; zero-shot cloning is opt-in with your own reference. Playback (dashboard + overlay via `shared/reader.js`): auto-read toggle, per-message read, re-roll (fresh take), stop / replay-last (exact take), and long-message consent with an instant pre-rendered "continue reading" chip.
+
+The overlay and voice never fight: auto-read defers to a live voice session, and a push-to-talk press always silences the Reader.
+
+See [voice/README.md](./voice/README.md) for setup, and `voice/.env.example` for every knob.
 
 ---
 
@@ -229,7 +240,9 @@ Once the agent is running, here are good starting points:
 
 ---
 
-## Tools (51 total)
+## Tools (54 total)
+
+Tools are organized **by category** (`TOOL_CATEGORIES` in `graph.py`) — the agent sees a categorized manifest instead of one long blob, and the dashboard's tool list groups the same way. New category: **Skills** — reusable workflow playbooks as `SKILL.md` files the agent can list, load, and even author for itself (`src/agent/skills/`).
 
 ### Memory & Recall
 - **`core_memory_update/append/rollback`** — Edit versioned core memory blocks with full rollback

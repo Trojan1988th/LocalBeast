@@ -1,0 +1,4 @@
+# dist/ is intentionally TRACKED — /api/overlay/launch runs the built app.
+node_modules/
+.env
+settings.json
