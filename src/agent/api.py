@@ -128,6 +128,20 @@ async def lifespan(app: FastAPI):
     app.state.agent = build_agent()
     # Start background services
     start_scheduler()
+    # Durable reminders poller: fires due rows every 30s. Runs in its own
+    # asyncio task so a slow Telegram send can't stall the event loop.
+    import asyncio as _asyncio
+
+    async def _reminder_poller():
+        from .reminders import fire_due_reminders
+        while True:
+            try:
+                await _asyncio.to_thread(fire_due_reminders)
+            except Exception as _re:
+                logger.warning("Reminder poller error: %s", _re)
+            await _asyncio.sleep(30)
+
+    app.state._reminder_poll_task = _asyncio.create_task(_reminder_poller())
     start_discord_listener(app.state.agent)
     telegram_task = start_telegram_listener(app.state.agent)
     webhook_url = os.environ.get("TELEGRAM_WEBHOOK_URL", "").strip()
@@ -1654,6 +1668,51 @@ def journal_delete(entry_id: int):
         raise HTTPException(status_code=404, detail="Entry not found")
     return {"success": True}
 
+
+# ── Seasons: the first-class rest state ──────────────────────────────────────
+
+@api_router.get("/seasons")
+def get_seasons_state():
+    """Current Seasons state + how quiet it's been (for the Heartbeat tab)."""
+    from .seasons import get_state, days_quiet
+    state = get_state()
+    return {**state, "days_quiet": days_quiet()}
+
+
+@api_router.post("/seasons/enter")
+def seasons_enter_manual():
+    """The user starts a quiet season explicitly. The proactive layer rests;
+    the reactive agent and user-commissioned reminders keep working; the
+    watchdog keeps watching."""
+    from .seasons import enter
+    return enter(mode="manual")
+
+
+@api_router.post("/seasons/exit")
+def seasons_exit_manual():
+    """The user ends the season — the only way it ends. Warm and unaccounted."""
+    from .seasons import exit_season
+    return exit_season()
+
+
+@api_router.get("/vitals")
+def get_vitals():
+    """The agent's self-health check — same data the self_vitals tool sees."""
+    from .vitals import collect
+    return collect()
+
+
+# Books tab: import, chapters, player, pre-render queue, export.
+from .books import register_books_routes  # noqa: E402
+register_books_routes(api_router)
+
+# RPG tab: story manager, Known + Mystery modes, Director, engine selector.
+from .rpg import register_rpg_routes  # noqa: E402
+register_rpg_routes(api_router)
+
+# Reflections tab: quiet shared journal.
+from .reflections import register_reflections_routes  # noqa: E402
+register_reflections_routes(api_router)
 
 # Voice mode: SSE streaming chat route — POST /api/chat/stream (+ arm-image).
 # All logic lives in voice_stream.py; this is the only api.py touchpoint.

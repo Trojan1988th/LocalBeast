@@ -1,11 +1,24 @@
 import { useState, useRef, useEffect, useLayoutEffect } from 'react'
 import ReactMarkdown from 'react-markdown'
+import { createReader, formatTagsForDisplay, DEFAULT_AUTOREAD_CAP } from '../../shared/reader.js'
 import Picker from '@emoji-mart/react'
 import emojiData from '@emoji-mart/data'
 import NotesTab from './NotesTab'
 import JournalTab from './JournalTab'
+import BooksTab from './BooksTab.jsx'
+import RpgTab from './RpgTab.jsx'
+import ReflectionsTab from './ReflectionsTab.jsx'
 
 const API_BASE = '/api'
+
+// ── Reader — playback module shared with the overlay ─────────────────────────
+const reader = createReader()
+// Long-message consent cap (chars of speech text; 0 = read everything).
+// Configurable: localStorage key 'agent_reader_cap'.
+const READER_CAP = (() => {
+  const v = parseInt(localStorage.getItem('agent_reader_cap') ?? '', 10)
+  return Number.isFinite(v) ? v : DEFAULT_AUTOREAD_CAP
+})()
 
 // Strip <actions><react emoji="X" /></actions> and replace with actual emoji
 const EMOJI_MAP = { heart: '❤️', smile: '😊', thumbsup: '👍', wave: '👋', star: '⭐' }
@@ -1084,7 +1097,7 @@ function DataTab() {
         <div className="flex justify-center py-12 text-slate-400">Loading…</div>
       ) : !configured ? (
         <div className="bg-slate-800/30 rounded-xl border border-dashed border-slate-700 p-8 text-center text-slate-400">
-          <p>Set KNOWLEDGE_DATABASE_URL and create the <code className="text-slate-300">rowan-data</code> database with pgvector.</p>
+          <p>Set KNOWLEDGE_DATABASE_URL and create the <code className="text-slate-300">agent-knowledge</code> database with pgvector.</p>
           <p className="text-sm mt-2">See .env.example for setup instructions.</p>
         </div>
       ) : files.length === 0 ? (
@@ -1420,6 +1433,12 @@ function ChatTab() {
   const userJustSentRef = useRef(false)
   const wasNearBottomRef = useRef(true)
 
+  // Reader: global auto-read toggle (persisted) + playback state ticks
+  const [autoRead, setAutoRead] = useState(() => localStorage.getItem('agent_auto_read') === 'true')
+  const [, setReaderTick] = useState(0)
+  useEffect(() => { localStorage.setItem('agent_auto_read', autoRead) }, [autoRead])
+  useEffect(() => reader.onChange(() => setReaderTick((t) => t + 1)), [])
+
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }
@@ -1488,6 +1507,9 @@ function ChatTab() {
     const text = input.trim()
     const hasFiles = attachments.length > 0
     if ((!text && !hasFiles) || loading) return
+    // Send runs in the click/Enter gesture callstack — unlock audio here so
+    // auto-read works after a page reload with the toggle already ON.
+    if (autoRead) reader.unlock()
 
     const displayText = text || (hasFiles ? `[${attachments.length} file(s) attached]` : '')
 
@@ -1523,6 +1545,7 @@ function ChatTab() {
         const form = new FormData()
         form.append('message', text)
         form.append('thread_id', 'main')
+        form.append('read_aloud', autoRead) // addendum rides the upload path too
         attachments.forEach((f) => form.append('files', f))
         res = await fetch(`${API_BASE}/chat/upload`, {
           method: 'POST',
@@ -1532,7 +1555,11 @@ function ChatTab() {
         res = await fetch(`${API_BASE}/chat`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ message: text, thread_id: 'main' }),
+          body: JSON.stringify({
+            message: text,
+            thread_id: 'main',
+            read_aloud: autoRead, // ephemeral addendum: the agent scores its delivery
+          }),
         })
       }
 
@@ -1548,6 +1575,10 @@ function ChatTab() {
           ...prev,
           { role: 'assistant', content: data.response, metadata: {} },
         ])
+        // Auto-read carries the user's message as delivery context; read-this /
+        // re-roll on history stay context-free. Long replies are capped at a
+        // natural break — a "continue reading" chip resumes.
+        if (autoRead) reader.readAuto(data.response, { context: text, cap: READER_CAP })
       } else {
         await loadHistory()
       }
@@ -1617,15 +1648,47 @@ function ChatTab() {
           {visibleMessages.map((msg, i) => {
             const isCron = msg.metadata?.role_display === 'cron'
 
+            const readBtn = msg.content ? (
+              <span className="self-end mb-1 shrink-0 flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                <button
+                  type="button"
+                  onClick={() => reader.read(msg.content)}
+                  className="text-slate-500 hover:text-emerald-400"
+                  title="Read this aloud (works on any message, including history)"
+                >
+                  🔊
+                </button>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    const dl = await reader.downloadMessage(msg.content)
+                    if (!dl) return
+                    const url = URL.createObjectURL(dl.blob)
+                    const a = document.createElement('a')
+                    a.href = url
+                    a.download = dl.filename
+                    a.click()
+                    URL.revokeObjectURL(url)
+                  }}
+                  disabled={reader.downloading}
+                  className="text-slate-500 hover:text-sky-400 disabled:opacity-40"
+                  title="Download this reading as WAV — recent readings download exactly as you heard them; older ones re-render as a fresh take"
+                >
+                  {reader.downloading ? '⏳' : '💾'}
+                </button>
+              </span>
+            ) : null
+
             if (isCron) {
               return (
-                <div key={i} className="flex justify-start">
+                <div key={i} className="flex justify-start group">
                   <div className="max-w-[85%]">
                     <p className="text-xs text-indigo-400 mb-1">⏰ Automated Cron</p>
                     <div className="bg-indigo-900/20 text-indigo-200 border border-indigo-700/50 rounded-2xl px-4 py-3">
                       <p className="whitespace-pre-wrap break-words text-sm">{msg.content}</p>
                     </div>
                   </div>
+                  {readBtn}
                 </div>
               )
             }
@@ -1633,8 +1696,9 @@ function ChatTab() {
             return (
               <div
                 key={i}
-                className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
+                className={`flex gap-1.5 group ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
               >
+                {msg.role === 'user' && readBtn}
                 <div
                   className={`max-w-[85%] rounded-2xl px-4 py-3 ${
                     msg.role === 'user'
@@ -1651,7 +1715,7 @@ function ChatTab() {
                           p: ({ children }) => <p className="whitespace-pre-wrap break-words">{children}</p>,
                         }}
                       >
-                        {cleanAssistantContent(msg.content) ?? msg.error ?? ''}
+                        {formatTagsForDisplay(cleanAssistantContent(msg.content)) ?? msg.error ?? ''}
                       </ReactMarkdown>
                     </div>
                   ) : (
@@ -1689,7 +1753,21 @@ function ChatTab() {
                       )}
                     </div>
                   )}
+                  {/* Long-message consent: capped auto-read offers the rest */}
+                  {msg.role === 'assistant' &&
+                    reader.hasPendingContinuation() &&
+                    reader.partial?.fullRaw === msg.content && (
+                    <button
+                      type="button"
+                      onClick={() => reader.continueReading()}
+                      className="mt-2 text-xs text-sky-400 hover:text-sky-300 border border-sky-500/30 rounded-lg px-2 py-1 transition-colors"
+                      title="The reading stopped at a natural break — continue from there (pre-rendered, starts instantly)"
+                    >
+                      continue reading ▸
+                    </button>
+                  )}
                 </div>
+                {msg.role !== 'user' && readBtn}
               </div>
             )
           })}
@@ -1761,6 +1839,51 @@ function ChatTab() {
               className="flex-1 min-h-[44px] max-h-[200px] rounded-xl bg-slate-800/80 border border-slate-700 px-4 py-3 text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/50 focus:border-emerald-500/50 disabled:opacity-50 overflow-y-auto"
               style={{ resize: 'none' }}
             />
+            {/* Reader controls */}
+          <div className="flex items-center gap-1.5">
+            <button
+              type="button"
+              onClick={() => {
+                reader.unlock() // this click IS the autoplay-unlock gesture
+                setAutoRead((v) => !v)
+              }}
+              className={`rounded-xl border px-3 py-2 text-sm font-medium transition-colors flex items-center gap-1.5 ${
+                autoRead
+                  ? 'bg-sky-600/20 border-sky-500 text-sky-300 hover:bg-sky-600/30'
+                  : 'bg-slate-800 border-slate-700 text-slate-400 hover:bg-slate-700'
+              }`}
+              title={autoRead ? 'Auto-read ON — the agent performs its replies aloud' : 'Auto-read OFF — click to enable (also unlocks audio)'}
+            >
+              🔊 {autoRead ? 'ON' : 'OFF'}
+            </button>
+            <button
+              type="button"
+              onClick={() => reader.stop()}
+              disabled={!reader.playing}
+              className="rounded-xl bg-slate-800 border border-slate-700 px-2.5 py-2 text-sm text-slate-300 hover:bg-slate-700 disabled:opacity-40 transition-colors"
+              title="Stop reading (cancels the render too)"
+            >
+              ⏹
+            </button>
+            <button
+              type="button"
+              onClick={() => reader.replayLast()}
+              disabled={!reader.last || reader.playing}
+              className="rounded-xl bg-slate-800 border border-slate-700 px-2.5 py-2 text-sm text-slate-300 hover:bg-slate-700 disabled:opacity-40 transition-colors"
+              title="Replay last reading — the exact same take"
+            >
+              ↻
+            </button>
+            <button
+              type="button"
+              onClick={() => reader.reroll()}
+              disabled={!reader.last || reader.playing}
+              className="rounded-xl bg-slate-800 border border-slate-700 px-2.5 py-2 text-sm text-slate-300 hover:bg-slate-700 disabled:opacity-40 transition-colors"
+              title="Re-roll — same text, fresh generation (a different take)"
+            >
+              🎲
+            </button>
+          </div>
             {/* Emoji picker */}
           <div className="relative" ref={emojiPickerRef}>
             <button
@@ -2006,15 +2129,21 @@ function HeartbeatTab() {
   const [startingScheduler, setStartingScheduler] = useState(false)
   const [startSchedulerMsg, setStartSchedulerMsg] = useState(null)
 
+  // Seasons state (the rest flag; exit is manual only, here)
+  const [seasons, setSeasons] = useState(null)
+  const [seasonsBusy, setSeasonsBusy] = useState(false)
+
   const load = async () => {
     try {
-      const [sRes, hRes, cRes, pRes] = await Promise.all([
+      const [sRes, hRes, cRes, pRes, znRes] = await Promise.all([
         fetch(`${API_BASE}/heartbeat/status`),
         fetch(`${API_BASE}/heartbeat/sessions?limit=50`),
         fetch(`${API_BASE}/heartbeat/config`),
         fetch(`${API_BASE}/heartbeat/prompts`),
+        fetch(`${API_BASE}/seasons`),
       ])
       if (sRes.ok) setStatus(await sRes.json())
+      if (znRes.ok) setSeasons(await znRes.json())
       if (hRes.ok) { const d = await hRes.json(); setSessions(d.sessions || []) }
       if (cRes.ok) { const c = await cRes.json(); setCfg(c); setCfgDirty(false) }
       if (pRes.ok) {
@@ -2197,6 +2326,44 @@ function HeartbeatTab() {
 
   return (
     <div className="space-y-6 max-w-3xl">
+
+      {/* ── Seasons (rest state) ── */}
+      {seasons && (
+        <div className={`rounded-xl p-5 border ${seasons.active
+          ? 'bg-indigo-950/40 border-indigo-600/50'
+          : 'bg-slate-900 border-slate-700'}`}>
+          <div className="flex items-center justify-between gap-3 flex-wrap">
+            <div>
+              <h2 className="font-semibold text-slate-100">
+                🕊 Season {seasons.active ? '— resting' : '— off'}
+              </h2>
+              <p className="text-xs text-slate-400 mt-1 max-w-lg">
+                {seasons.active
+                  ? `A quiet season is on (${seasons.mode === 'auto' ? 'began on its own after the quiet' : 'you started it'}). The agent answers whenever you talk to it, your reminders still fire, and the watchdog still watches — but it won't reach out first, and its heartbeat keeps a slow keeper's rhythm. It ends only here, by your hand.`
+                  : `When on, the agent's proactive side rests — no briefings, no nudges — while the reactive agent, your reminders, and the watchdog keep working. Starts on its own after ${seasons.auto_entry_days} quiet days, or here, anytime.`}
+              </p>
+            </div>
+            <button
+              type="button"
+              disabled={seasonsBusy}
+              onClick={async () => {
+                if (seasons.active && !window.confirm('End the season? The agent\'s proactive side (briefings, notes) wakes back up.')) return
+                if (!seasons.active && !window.confirm('Begin a quiet season now? The agent will go still until you end it — it\'ll still answer whenever you talk to it.')) return
+                setSeasonsBusy(true)
+                try {
+                  await fetch(`${API_BASE}/seasons/${seasons.active ? 'exit' : 'enter'}`, { method: 'POST' })
+                  await load()
+                } finally { setSeasonsBusy(false) }
+              }}
+              className={`rounded-xl px-4 py-2 text-sm font-medium disabled:opacity-50 ${seasons.active
+                ? 'bg-amber-600 hover:bg-amber-500 text-white'
+                : 'bg-indigo-600 hover:bg-indigo-500 text-white'}`}
+            >
+              {seasonsBusy ? '…' : seasons.active ? 'End the season' : 'Begin a quiet season'}
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* ── Schedule Config ── */}
       {cfg && (
@@ -2488,6 +2655,9 @@ function HeartbeatTab() {
 
 const TABS = [
   { id: 'chat', label: 'Chat' },
+  { id: 'books', label: 'Books' },
+  { id: 'rpg', label: 'RPG' },
+  { id: 'reflect', label: 'Reflect' },
   { id: 'journal', label: 'Journal' },
   { id: 'notes', label: 'Notes' },
   { id: 'core', label: 'Core' },
@@ -2556,6 +2726,14 @@ function App() {
             <div className="flex-1 flex flex-col overflow-hidden min-w-0">
               <ChatTab />
             </div>
+          ) : activeTab === 'books' ? (
+            <BooksTab reader={reader} />
+          ) : activeTab === 'rpg' ? (
+            <RpgTab />
+          ) : activeTab === 'reflect' ? (
+            <main className="flex-1 overflow-y-auto px-6 py-6">
+              <ReflectionsTab />
+            </main>
           ) : activeTab === 'journal' ? (
             <main className="flex-1 overflow-y-auto px-6 py-6">
               <JournalTab />

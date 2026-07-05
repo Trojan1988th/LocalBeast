@@ -29,7 +29,7 @@ Flags:
     --switch        Update .env after a successful restore. Comments out the
                     Railway DATABASE_URL and inserts the local one.
     --verify-only   Compare row counts between Railway and local (no migration).
-    --db-name NAME  Target database name (default: rowan-agent).
+    --db-name NAME  Target database name (default: agent-db).
     --skip-backup   Skip the pg_dump safety backup (NOT recommended).
 """
 from __future__ import annotations
@@ -352,7 +352,7 @@ def switch_env(creds: dict, db_name: str) -> None:
     """
     Update .env in-place:
       - Comment out current DATABASE_URL line (prefix with '# [pre-migration] ')
-      - Insert new DATABASE_URL pointing to local rowan-agent DB
+      - Insert new DATABASE_URL pointing to local agent-db DB
     """
     print("\n=== Step 5: Update .env ===\n")
 
@@ -429,7 +429,7 @@ def main() -> None:
     p.add_argument("--run",          action="store_true", help="Execute the migration (backup + restore)")
     p.add_argument("--switch",       action="store_true", help="Update .env to use local DB after migration")
     p.add_argument("--verify-only",  action="store_true", help="Only compare row counts (no migration)")
-    p.add_argument("--db-name",      default="rowan-agent", help="Target database name (default: rowan-agent)")
+    p.add_argument("--db-name",      default="agent-db", help="Target database name (default: agent-db)")
     p.add_argument("--skip-backup",  action="store_true", help="Skip pg_dump safety backup (NOT recommended)")
     args = p.parse_args()
 

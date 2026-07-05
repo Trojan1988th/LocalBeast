@@ -1,0 +1,5 @@
+# The Director holds secrets — NONE of this may ever be committed.
+.director_key
+.env
+secrets/
+*.enc

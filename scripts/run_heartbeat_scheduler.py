@@ -67,6 +67,15 @@ def _get_mode_and_interval() -> tuple[str, int]:
     return mode, interval
 
 
+def _stamp():
+    """Freshness stamp for the watchdog/vitals — written every tick, even on
+    skips: 'the scheduler is alive' is a different fact from 'a cycle ran'."""
+    import time
+    stamp = Path(__file__).resolve().parents[1] / "data" / "heartbeat_last.txt"
+    stamp.parent.mkdir(parents=True, exist_ok=True)
+    stamp.write_text(str(time.time()), encoding="utf-8")
+
+
 def run_one_heartbeat():
     global _current_interval, _scheduler_ref
 
@@ -81,12 +90,47 @@ def run_one_heartbeat():
         except Exception as e:
             print(f"[Heartbeat] Could not reschedule: {e}")
 
+    # SEASONS: quiet seasons are a first-class rest state, not a kill-switch.
+    # Auto-entry happens here (this tick runs regardless); while a season is
+    # on, the heartbeat drops to the keeper cadence and carries the keeper
+    # frame. Exit is manual only — the user's hand on the flag.
+    from src.agent import seasons
+    try:
+        seasons.maybe_auto_enter()
+        if seasons.is_active():
+            _stamp()  # scheduler alive; the season just slows the cycles
+            import time
+            state = seasons.get_state()
+            cadence_s = float(state.get("keeper_cadence_hours", 168)) * 3600
+            last_cycle = 0.0
+            cycle_stamp = Path(__file__).resolve().parents[1] / "data" / "heartbeat_last_cycle.txt"
+            try:
+                last_cycle = float(cycle_stamp.read_text().strip())
+            except Exception:
+                pass
+            if time.time() - last_cycle < cadence_s:
+                print("[Heartbeat] Season active — resting until the next keeper cycle")
+                return
+            mode = "keeper"
+    except Exception as e:
+        print(f"[Heartbeat] Seasons check failed (continuing normally): {e}")
+
     from src.agent.heartbeat import run_heartbeat
     try:
         run_heartbeat(mode=mode)
+        import time
+        cycle_stamp = Path(__file__).resolve().parents[1] / "data" / "heartbeat_last_cycle.txt"
+        cycle_stamp.write_text(str(time.time()), encoding="utf-8")
         print(f"[Heartbeat:{mode}] Cycle complete")
     except Exception as e:
         print(f"[Heartbeat:{mode}] Error: {e}")
+        try:
+            from src.agent.failures import bump
+            bump("heartbeat_cycle", str(e))
+        except Exception:
+            pass
+    finally:
+        _stamp()
 
 
 def main():
@@ -113,6 +157,8 @@ def main():
     scheduler = BlockingScheduler()
     _scheduler_ref = scheduler
     scheduler.add_job(run_one_heartbeat, "interval", minutes=start_interval, id="heartbeat")
+    _stamp()  # freshness stamp at startup so the watchdog knows we're alive
+              # before the first tick (first cycle fires after one interval)
 
     print(
         f"Heartbeat scheduler started\n"

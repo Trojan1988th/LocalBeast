@@ -39,10 +39,38 @@ export function formatTagsForDisplay(text) {
   return text.replace(READER_TAGS_RE, '*$&*')
 }
 
+// Choice-block detector (RPG S5): a DM turn ends with a numbered/lettered list
+// of options. Reading "Option one colon..." aloud is misery — the choices are
+// read with the eyes. Strips a TRAILING run of 2+ choice-like lines (plus a
+// lead-in like "What do you do?"). Opt-in — chat/books never pass stripChoices.
+const _CHOICE_LINE = /^\s*(\d{1,2}[.)]|[-*•]|[A-Ea-e][.)])\s+\S/
+export function stripTrailingChoiceBlock(text) {
+  const lines = text.split('\n')
+  let seen = 0
+  let start = -1
+  for (let j = lines.length - 1; j >= 0; j--) {
+    const l = lines[j]
+    if (!l.trim()) { if (start === -1) continue; else break }
+    if (_CHOICE_LINE.test(l)) { seen++; start = j; continue }
+    break
+  }
+  if (seen < 2 || start < 0) return text
+  let cut = start
+  for (let j = start - 1; j >= 0; j--) {
+    const l = lines[j].trim()
+    if (!l) continue
+    if (l.length < 60 && /(what do you do|your (options|choices)|choose|options?:|do you)/i.test(l)) cut = j
+    break
+  }
+  return lines.slice(0, cut).join('\n').trim()
+}
+
 // What the voice gets: the words + performance tags, minus markdown the engine
 // would speak literally. Emoji + unknown tags are stripped service-side.
-export function textForSpeech(text) {
-  return (cleanActions(text) || '')
+export function textForSpeech(text, { stripChoices = false } = {}) {
+  let t = cleanActions(text) || ''
+  if (stripChoices) t = stripTrailingChoiceBlock(t)
+  return t
     .replace(/```[\s\S]*?```/g, ' Code block omitted. ')
     .replace(/`([^`]+)`/g, '$1')
     .replace(/!\[[^\]]*\]\([^)]*\)/g, '')
@@ -71,6 +99,39 @@ export function splitAtBreak(text, cap) {
   return rest ? [head, rest] : [text, null]
 }
 
+// Encode float32 PCM (24kHz mono) as a complete WAV blob with real sizes.
+export function wavBlob(pcm) {
+  const len = pcm.length
+  const buf = new ArrayBuffer(44 + len * 2)
+  const v = new DataView(buf)
+  const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)) }
+  w(0, 'RIFF'); v.setUint32(4, 36 + len * 2, true); w(8, 'WAVEfmt ')
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true)
+  v.setUint32(24, 24000, true); v.setUint32(28, 48000, true)
+  v.setUint16(32, 2, true); v.setUint16(34, 16, true)
+  w(36, 'data'); v.setUint32(40, len * 2, true)
+  const i16 = new Int16Array(buf, 44)
+  for (let i = 0; i < len; i++) i16[i] = Math.max(-32768, Math.min(32767, Math.round(pcm[i] * 32767)))
+  return new Blob([buf], { type: 'audio/wav' })
+}
+
+// "YYYY-MM-DD_first-few-words.wav" — date FIRST so folders sort chronologically.
+export function downloadNameFor(rawText) {
+  const words = textForSpeech(rawText)
+    .replace(READER_TAGS_RE, '')
+    .replace(/[^\w\s-]/g, '')
+    .trim()
+    .split(/\s+/)
+    .slice(0, 6)
+    .join('-')
+    .toLowerCase() || 'reading'
+  const d = new Date()
+  const date = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+  return `${date}_${words.slice(0, 60)}.wav`
+}
+
+const RENDER_CACHE_MAX = 8 // rolling — recent messages download as the take you heard
+
 export function createReader({ base = READER_BASE } = {}) {
   return {
     ctx: null,
@@ -78,9 +139,13 @@ export function createReader({ base = READER_BASE } = {}) {
     sources: [],
     cursor: 0,
     playing: false,
-    last: null,         // { text, context, pcm } — exact-replay cache (speech text)
+    downloading: false,
+    last: null,         // { text, raw, context, pcm } — exact-replay cache
     partial: null,      // { fullRaw, head, rest, context, cap } — a capped auto-read
     continuation: null, // { text, context, pcm: [], done, consumed, ac }
+    // Rolling cache of completed renders keyed by the message's RAW text, so a
+    // download is the take that was actually heard. partial=true = head only.
+    cache: new Map(),
     listeners: new Set(),
     onChange(fn) { this.listeners.add(fn); return () => this.listeners.delete(fn) },
     emit() { this.listeners.forEach((fn) => fn()) },
@@ -112,6 +177,7 @@ export function createReader({ base = READER_BASE } = {}) {
       }
       this.sources.forEach((s) => { try { s.stop() } catch { /* already ended */ } })
       this.sources = []
+      this.cursor = 0 // never let a superseded read's schedule position leak forward
       this.playing = false
       this.emit()
     },
@@ -180,9 +246,29 @@ export function createReader({ base = READER_BASE } = {}) {
       for (const p of parts) { pcm.set(p, off); off += p.length }
       return pcm
     },
-    // Play one text audibly. speechText must already be textForSpeech-clean when
-    // preCleaned; context is passed through textForSpeech here either way.
-    async _play(speechText, context) {
+    // Rolling render cache (download = the take that was heard). append=true
+    // promotes a partial (head-only) entry to a full one.
+    _cacheStore(key, pcm, { partial = false, append = false } = {}) {
+      if (!key || !pcm?.length) return
+      if (append && this.cache.has(key)) {
+        const prev = this.cache.get(key)
+        const merged = new Float32Array(prev.pcm.length + pcm.length)
+        merged.set(prev.pcm)
+        merged.set(pcm, prev.pcm.length)
+        this.cache.delete(key)
+        this.cache.set(key, { pcm: merged, partial: false })
+      } else {
+        this.cache.delete(key)
+        this.cache.set(key, { pcm, partial })
+      }
+      while (this.cache.size > RENDER_CACHE_MAX) {
+        this.cache.delete(this.cache.keys().next().value)
+      }
+    },
+    // Play one text audibly. speechText must already be textForSpeech-clean;
+    // context is passed through textForSpeech here. cacheKey = the message's
+    // RAW text, so downloads can find the exact take that was heard.
+    async _play(speechText, context, cacheKey = null, { partialCache = false } = {}) {
       const ac = new AbortController()
       this.abort = ac
       this.playing = true
@@ -195,7 +281,8 @@ export function createReader({ base = READER_BASE } = {}) {
           ac.signal,
           (f32) => this._schedule(f32),
         )
-        this.last = { text: speechText, context, pcm }
+        this.last = { text: speechText, raw: cacheKey ?? speechText, context, pcm }
+        if (cacheKey) this._cacheStore(cacheKey, pcm, { partial: partialCache })
         if (this.abort === ac) this.abort = null
         if (!this.sources.length) this.playing = false
         this.emit()
@@ -211,13 +298,14 @@ export function createReader({ base = READER_BASE } = {}) {
       }
     },
     // Read-this: the WHOLE message, no cap, context only if explicitly given.
-    async read(rawText, { context = null } = {}) {
+    // stripChoices (RPG): drop the trailing choice list from what's spoken.
+    async read(rawText, { context = null, stripChoices = false } = {}) {
       this.unlock()
       this.stop({ cancelServer: true })
       await this._awaitCancel() // cancel must land BEFORE the new /read registers
-      const text = textForSpeech(rawText)
+      const text = textForSpeech(rawText, { stripChoices })
       if (!text) return
-      await this._play(text, context)
+      await this._play(text, context, rawText)
     },
     // True while a capped auto-read has an unconsumed continuation — surfaces
     // key the "continue reading ▸" chip off this (+ partial.fullRaw to find
@@ -235,12 +323,14 @@ export function createReader({ base = READER_BASE } = {}) {
       if (!text) return
       const [head, rest] = splitAtBreak(text, cap)
       if (!rest) {
-        await this._play(text, context)
+        await this._play(text, context, rawText)
         return
       }
       this.partial = { fullRaw: rawText, head, rest, context, cap }
       this.emit() // surfaces can show the chip immediately
-      const ok = await this._play(head, context) // resolves at fetch-done (playback continues)
+      // resolves at fetch-done (playback continues); cached as partial until
+      // the continuation's render completes and promotes it to a full take
+      const ok = await this._play(head, context, rawText, { partialCache: true })
       if (!ok || this.partial?.rest !== rest) return // stopped/preempted meanwhile
       // Quiet pre-render of the continuation (service is free again: head fetch
       // is complete server-side; playback outlives it at RTF<1).
@@ -260,6 +350,8 @@ export function createReader({ base = READER_BASE } = {}) {
         .then((pcm) => {
           cont.done = true
           cont.fullPcm = pcm
+          // Promote the cached head to a complete take (what a download gets)
+          this._cacheStore(rawText, pcm, { append: true })
           if (cont.consumed) {
             this.last = { text: rest, context, pcm }
             if (this.continuation === cont) this.continuation = null
@@ -319,7 +411,36 @@ export function createReader({ base = READER_BASE } = {}) {
         const { fullRaw, context, cap } = this.partial
         this.readAuto(fullRaw, { context, cap })
       } else if (this.last) {
-        this.read(this.last.text, { context: this.last.context })
+        // raw (not speech text) so the fresh take replaces the cached one
+        this.read(this.last.raw ?? this.last.text, { context: this.last.context })
+      }
+    },
+    // 💾 Download a message's reading as WAV. Cache hit = the exact take that
+    // was heard; miss (evicted / never fully rendered) = a quiet fresh render.
+    // Never preempts live playback: waits for any in-flight fetch first
+    // (renders finish well before their playback does).
+    async downloadMessage(rawText) {
+      const hit = this.cache.get(rawText)
+      if (hit && !hit.partial) {
+        return { blob: wavBlob(hit.pcm), filename: downloadNameFor(rawText), fresh: false }
+      }
+      const text = textForSpeech(rawText)
+      if (!text) return null
+      this.downloading = true
+      this.emit()
+      try {
+        while (this.abort || (this.continuation && !this.continuation.done)) {
+          await new Promise((r) => setTimeout(r, 300))
+        }
+        const pcm = await this._fetchRender(text, null, undefined, null)
+        this._cacheStore(rawText, pcm)
+        return { blob: wavBlob(pcm), filename: downloadNameFor(rawText), fresh: true }
+      } catch (e) {
+        console.warn('reader download:', e)
+        return null
+      } finally {
+        this.downloading = false
+        this.emit()
       }
     },
   }

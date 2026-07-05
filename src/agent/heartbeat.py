@@ -141,6 +141,11 @@ def load_heartbeat_prompt(mode: str = "wonder") -> str:
       3. Built-in default for the mode
     """
     mode = mode.lower().strip()
+    # 'keeper' (Seasons): the slow-cadence rest-state cycle. Its prompt is
+    # fixed in seasons.py — the true frame must not drift with dashboard edits.
+    if mode == "keeper":
+        from .seasons import KEEPER_PROMPT
+        return KEEPER_PROMPT
     # 'day' uses the wonder prompt (same exploratory spirit, but user may be online)
     effective_mode = "wonder" if mode in ("wonder", "day") else "work"
 
@@ -236,8 +241,11 @@ def run_heartbeat(
     check_connection()
 
     # Resolve mode: explicit > auto (time-based)
+    # "day" is a valid mode from the scheduler — it uses the wonder prompt.
     resolved_mode = (mode or _get_auto_mode()).lower().strip()
-    if resolved_mode not in ("wonder", "work"):
+    if resolved_mode == "day":
+        resolved_mode = "wonder"
+    elif resolved_mode not in ("wonder", "work", "keeper"):
         logger.warning("Unknown heartbeat mode %r — falling back to 'wonder'", resolved_mode)
         resolved_mode = "wonder"
 

@@ -1,0 +1,119 @@
+Bug Report: Document Deletion Leaves Orphaned Observation Nodes
+Repository: vectorize-io/hindsight
+
+Severity: Medium — silent data contamination; no crash, but deleted memories remain retrievable
+
+Discovered by: the user + Claude Code (Anthropic)
+
+Summary
+When a document is deleted via the Hindsight dashboard (or DELETE /documents/{id} API), consolidation-derived observation memory units that were generated from that document's memory units are not deleted. They become permanently orphaned — no document anchor, no chunk anchor, no graph edges — but remain fully embedded and retrievable via semantic search. Users believe they have deleted a memory, but the AI can still recall it.
+
+Root Cause (Two Layers)
+Layer 1 — FK cascade was SET NULL instead of CASCADE
+
+The foreign key from memory_units.chunk_id → chunks.chunk_id used ON DELETE SET NULL. When a document was deleted, chunk-linked memory units had their chunk_id nulled out rather than being deleted, leaving them as ghost records with no parent.
+
+Layer 2 — Consolidation observations have no FK anchor at all
+
+This is the deeper, more insidious bug. Hindsight's consolidation process creates fact_type = 'observation' memory units that synthesize patterns across multiple source memories. These observations are linked to their sources via the source_memory_ids uuid[] array column — not via a foreign key. Because PostgreSQL cannot enforce referential integrity on array contents, there is no cascade mechanism. When the source memory units are deleted (by the document cascade), the observations survive with:
+
+document_id = NULL
+chunk_id = NULL
+source_memory_ids = {} (now empty, sources were deleted)
+No entries in memory_links
+No entries in unit_entities
+The delete_document() function in memory_engine.py only queries WHERE document_id = $1, so it never touches these observations.
+
+How to Identify Dead Nodes
+The correct method is via the graph API, not a simple SQL query. A SQL query filtering on chunk_id IS NULL AND document_id IS NULL returns thousands of rows including legitimate connected observations. The reliable approach:
+
+Step 1 — Fetch the full graph for a bank:
+
+
+GET /api/graph/{bank_id}
+This returns all nodes and edges (semantic, temporal, entity, causal links).
+
+Step 2 — Find nodes that appear in zero edges:
+
+
+node_ids = {node["id"] for node in graph["nodes"]}
+connected_ids = set()
+for edge in graph["edges"]:
+    connected_ids.add(edge["source"])
+    connected_ids.add(edge["target"])
+dead_node_ids = node_ids - connected_ids
+Step 3 — Cross-verify in SQL (optional, for confidence):
+
+
+SELECT id, fact_type, text, created_at
+FROM memory_units
+WHERE id = ANY($dead_node_ids)
+  AND NOT EXISTS (
+      SELECT 1 FROM memory_links ml
+      WHERE ml.from_unit_id = memory_units.id
+         OR ml.to_unit_id = memory_units.id
+  )
+  AND NOT EXISTS (
+      SELECT 1 FROM unit_entities ue WHERE ue.unit_id = memory_units.id
+  );
+In a production bank with ~2,100 total observations, this identified 255 true dead nodes — a small fraction of the pool that would have been invisible to SQL-only filtering.
+
+Fix Applied
+Fix 1 — Change FK cascade policy (migration):
+
+In alembic/versions/.../add_chunks_table.py:
+
+
+# Before
+op.create_foreign_key(
+    "memory_units_chunk_fkey", "memory_units", "chunks",
+    ["chunk_id"], ["chunk_id"], ondelete="SET NULL"
+)
+
+# After
+op.create_foreign_key(
+    "memory_units_chunk_fkey", "memory_units", "chunks",
+    ["chunk_id"], ["chunk_id"], ondelete="CASCADE"
+)
+Fix 2 — Explicit orphan cleanup in delete_document() (memory_engine.py):
+
+After the document's FK cascade completes, collect the deleted memory unit IDs and explicitly clean up any observations whose source_memory_ids overlapped them:
+
+
+# After deleting document and its memory units via FK cascade:
+if deleted and unit_ids:
+    unit_uuids = [uuid.UUID(uid) for uid in unit_ids]
+    orphan_result = await conn.fetchval(
+        f"""
+        DELETE FROM {fq_table('memory_units')}
+        WHERE bank_id = $1
+          AND fact_type = 'observation'
+          AND chunk_id IS NULL
+          AND document_id IS NULL
+          AND source_memory_ids && $2::uuid[]
+        """,
+        bank_id,
+        unit_uuids,
+    )
+The && operator is the PostgreSQL array overlap operator — it deletes any observation whose source list shares at least one ID with the just-deleted memory units.
+
+Verification
+Live test after fix applied:
+
+Document e8471565-3025-47b9-9d87-6ffae8211987 (2 memory units, chaos-gaming bank) — deleted via dashboard
+Document confirmed absent from documents table ✅
+Graph API + SQL query: zero orphaned observations ✅
+Before the fix, the same operation on document c79db4a3 (3 memory units) left 3 dead observation nodes that remained semantically searchable.
+
+Suggested Additional Hardening
+Consider adding a periodic integrity check endpoint or background job:
+
+
+SELECT COUNT(*) FROM memory_units
+WHERE fact_type = 'observation'
+  AND chunk_id IS NULL
+  AND document_id IS NULL
+  AND cardinality(source_memory_ids) = 0;
+A non-zero result indicates orphan accumulation from prior deletions. Existing orphans from before this fix can be safely cleaned with this query (after verifying content via the graph API method above).
+
+Bug discovered and fix developed by Claude Code (Anthropic). Credit to the user for identifying the symptom ("deleted memories the AI still remembers") and for patient live testing to isolate the two-layer root cause.

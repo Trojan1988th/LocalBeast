@@ -42,6 +42,25 @@ See [voice/README.md](./voice/README.md) for setup, and `voice/.env.example` for
 
 ---
 
+## Books, RPG, Reflections, and a Proactive Life (new)
+
+This release adds four feature families on top of the voice stack:
+
+| Feature | What it is | Docs |
+|---------|-----------|------|
+| **Books tab** | Import `.txt`/`.epub` (DRM detected and declined), chapter review, audiobook player (speed/bookmarks/highlights/follow-along), background pre-render with an STT-verify gate, M4B/MP3 export (user-supplied ffmpeg) | [docs/BOOKS.md](./docs/BOOKS.md) |
+| **RPG tab** | A DM that can keep a secret: Known + Mystery modes, a quarantined out-of-process **Director** holding the hidden truth (key generated per install), verifiable seal/reveal, lore upload with RAG, per-story engine selector (OpenRouter roster, cache-shaped prompts), story memory in its own bank | [docs/RPG.md](./docs/RPG.md) |
+| **Reflections tab** | A quiet shared journal: dated entries, the agent writes beneath yours, optional gentle evening nudge, rest days, zero gamification | [docs/PROACTIVITY.md](./docs/PROACTIVITY.md) |
+| **Proactive layer** | **Seasons** (a first-class rest state), `notify_user` outbound (Telegram, quiet hours, Seasons-gated, logged), voice notes, morning-briefing pattern, durable natural-language **reminders** (recurring + conditional with code-performed delivery), a dead-man **watchdog**, self-**vitals**, calendar (ICS) visibility | [docs/PROACTIVITY.md](./docs/PROACTIVITY.md) |
+
+Hardware notes: the Books/RPG/proactive features are CPU-light; the voice and
+Reader features want a GPU (see [voice/README.md](./voice/README.md) for VRAM
+guidance). Everything degrades gracefully when its config is absent.
+
+Upgrading an existing install? See [UPGRADING.md](./UPGRADING.md).
+
+---
+
 ## What Makes This Different
 
 Most agent frameworks solve the *memory* problem: how do you give an LLM access to past information? This project goes further and solves the *growth* problem: how does an agent develop genuine continuity of identity, intellectual positions, and relational depth over months of interaction?
@@ -127,9 +146,13 @@ cd dashboard && npm run dev
 Open http://localhost:5173
 
 The dashboard includes:
-- **Chat** — Main conversation with the agent
+- **Chat** — Main conversation, with Reader controls (auto-read, per-message read, re-roll, WAV download)
+- **Books** — Import a book, listen to it in the agent's voice ([docs/BOOKS.md](./docs/BOOKS.md))
+- **RPG** — Story manager + play view for the secret-keeping DM ([docs/RPG.md](./docs/RPG.md))
+- **Reflect** — The quiet shared journal
 - **Notes** — Kanban-style boards the agent can read and write via tools
 - **Journal** — Daily log of heartbeat outputs, reflections, and summaries
+- **Hbeat** — Heartbeat schedule, prompts, and the Seasons rest-state card
 - **Knowledge Bank** — Upload documents for semantic search (requires `KNOWLEDGE_DATABASE_URL`)
 
 ---
@@ -288,6 +311,11 @@ Tools are organized **by category** (`TOOL_CATEGORIES` in `graph.py`) — the ag
 ### Utilities
 - **`get_weather`** — Current + 3-day forecast via wttr.in (no API key)
 - **`set_reminder / list_reminders`** — One-shot reminders via Windows toast
+- **`schedule_reminder / snooze_reminder / cancel_reminder`** — Durable reminders (PostgreSQL): recurring + conditional, survive restarts
+- **`notify_user / voice_note / self_vitals`** — Outbound notifications (Seasons-gated, quiet hours, logged), Reader-voice Telegram notes, self-health check
+- **`calendar_week`** — Read-only ICS calendar visibility (`CALENDAR_ICS_URL`)
+- **`reflections_today / reflections_recent`** — The shared journal's state and recent entries
+- **`story_recall`** — One-way bridge from main chat into RPG story memory
 - **`get_current_time / get_current_timestamp`**
 - **`cron_schedule_heartbeat_tool / cron_remove_heartbeat_tool`**
 - **`notes_search / notes_add_item`** — Dashboard kanban boards
@@ -388,7 +416,9 @@ python scripts/import_core_memory.py "path/to/backup.json"
 - [x] Phase 4b: 51-tool suite (web, YouTube, RSS, files, Python, Discord, Telegram, screenshot, weather, reminders, TTS, clipboard)
 - [x] Phase 4c: Notes boards, Journal tab, Knowledge Bank, Electron gaming overlay
 - [x] Phase 5a: Living Logs — inner-life architecture (tension_log, loose_threads, evolving_positions, shared_lore, private_journal) with full weekly synthesis integration
-- [ ] Phase 5b: Cloud/Docker deployment (optional — not needed for local Windows use)
+- [x] Phase 6: Voice — realtime conversation (Pipecat + SSE streaming) + the Reader (Orpheus render service, auto-read, overlay playback)
+- [x] Phase 7: Books (audiobook pipeline), RPG (Writer/Director secret-keeping, engine selector), Reflections, and the proactive layer (Seasons, outbound, durable reminders, watchdog, vitals, calendar)
+- [ ] Phase 8: Cloud/Docker deployment (optional — not needed for local Windows use)
 
 ---
 

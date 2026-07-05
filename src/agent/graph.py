@@ -49,13 +49,18 @@ from .core_memory_tools import core_memory_append, core_memory_rollback, core_me
 from .db import append_messages, check_connection, load_messages, setup_schema
 from .document_tools import read_document
 from .file_tools import list_directory, move_to_trash, read_file, search_files, write_file
-from .hindsight import retain_exchange
+from .hindsight import retain_exchange, recall_with_privacy_flag
 from .hindsight_tools import hindsight_recall, hindsight_reflect
 from .journal_tools import read_journal, save_journal_entry
 from .living_logs_tools import LIVING_LOG_TOOLS
 from .knowledge_bank_tools import list_knowledge_bank, read_knowledge_bank_file, search_knowledge_bank
 from .python_repl_tools import python_repl
-from .reminder_tools import list_reminders, set_reminder
+from .reminder_tools import (cancel_reminder, list_reminders, schedule_reminder,
+                             set_reminder, snooze_reminder)
+from .outbound_tools import OUTREACH_TOOLS
+from .reflections_tools import REFLECTIONS_TOOLS
+from .calendar_tools import CALENDAR_TOOLS
+from .rpg_tools import story_recall
 from .rss_tools import rss_add_feed, rss_fetch, rss_list_feeds, rss_remove_feed
 from .screenshot_tools import analyze_screenshot
 from .telegram_tools import telegram_bot_info, telegram_read_messages, telegram_send_image, telegram_send_message, telegram_send_file
@@ -216,6 +221,12 @@ CHECKPOINT_PATH = Path(__file__).resolve().parents[2] / "data" / "checkpoints.db
 # Heartbeat skip: track when user was last actively chatting (Unix timestamp written here)
 LAST_ACTIVE_PATH = CHECKPOINT_PATH.parent / "last_active.txt"
 
+# Thread-local storage for passing context through to _build_core_memory_prompt.
+# LangGraph strips extra keys from invoke_state, so this is the side-channel:
+# thread_id (tools like story_recall gate on rpg:*), is_internal (Seasons
+# courtesy gate), rpg_spine (S7 cache-shaped story layer).
+_thread_ctx = threading.local()
+
 
 def get_checkpointer() -> SqliteSaver:
     """Create SQLite checkpointer for graph state."""
@@ -345,9 +356,14 @@ TOOL_CATEGORIES = [
     ("Utilities", [
         get_weather,
         set_reminder,
+        schedule_reminder,
         list_reminders,
+        cancel_reminder,
+        snooze_reminder,
         python_repl,
     ]),
+    ("Outreach", OUTREACH_TOOLS),  # notify_user, voice_note, self_vitals
+    ("Calendar", CALENDAR_TOOLS),  # read-only ICS subscription (CALENDAR_ICS_URL)
     ("Scheduling (Heartbeat)", [
         cron_schedule_heartbeat_tool,
         cron_remove_heartbeat_tool,
@@ -368,6 +384,8 @@ TOOL_CATEGORIES = [
         save_journal_entry,
     ]),
     ("Living Logs", LIVING_LOG_TOOLS),
+    ("Reflections", REFLECTIONS_TOOLS),  # shared journal: today's status + recent entries
+    ("RPG", [story_recall]),  # one-way bridge: main chat -> story memory (refuses in-story)
     ("Notes (Dashboard)", [
         notes_read,
         notes_search,
@@ -706,7 +724,14 @@ def _build_core_memory_prompt(state) -> list[BaseMessage]:
     # AgentState is a TypedDict and accepts extra keys, so current_time is accessible here.
     # Fall back to datetime.now() for heartbeat and other direct callers that don't pass it.
     current_time = (state.get("current_time") if isinstance(state, dict) else None) or datetime.now(AGENT_TIMEZONE)
-    parts.append(f"# Current Time\n\nIt is currently: {_format_current_time(current_time)}\n\n---\n\n")
+    # S7 cache shaping: RPG threads get a STABLE system prefix so provider prompt
+    # caches hit turn after turn. The volatile time header is skipped (the turn
+    # timestamp already rides the user-message prefix) and the story spine is
+    # appended at the end (see below). Non-RPG threads are unchanged.
+    _tid = getattr(_thread_ctx, "thread_id", "") or ""
+    _is_rpg = _tid.startswith("rpg:")
+    if not _is_rpg:
+        parts.append(f"# Current Time\n\nIt is currently: {_format_current_time(current_time)}\n\n---\n\n")
 
     # Tool manifest — injected right after time so the live tool list is seen before
     # anything else. The system_instructions DB block below may contain stale tool
@@ -748,6 +773,52 @@ def _build_core_memory_prompt(state) -> list[BaseMessage]:
             parts.append("Use `daily_summary_write` at the end of each day (or during heartbeat) to record what happened.\n\n---\n\n")
     except Exception:
         pass  # Don't crash the agent if summaries can't load
+
+    # RPG story spine (S7): base DM addendum + per-engine overlay + per-story
+    # instructions, set by chat() via thread-local (LangGraph strips extra state
+    # keys). Appended at the END of the system message — the stable story layer
+    # sits directly before the (append-only) campaign history, which is the
+    # cache-friendly order: stable prefix first, volatile content last. Guarded
+    # by thread id so a stale value from an errored turn never crosses stories.
+    if _is_rpg:
+        _spine = getattr(_thread_ctx, "rpg_spine", None)
+        if _spine and _spine[0] == _tid and _spine[1]:
+            parts.append(_spine[1] + "\n\n---\n\n")
+
+    # RPG now-playing awareness (S5): outside a story thread, note if the user is
+    # mid-campaign so "ready to play tonight?" lands. Additive, best-effort; skips
+    # inside the story thread itself and when the note is stale (>7 days).
+    try:
+        if not _is_rpg:
+            import json as _json
+            import time as _t
+            _np = CHECKPOINT_PATH.parent / "now_playing.json"
+            if _np.exists():
+                _d = _json.loads(_np.read_text(encoding="utf-8"))
+                if _t.time() - _d.get("updated_at", 0) < 7 * 86400:
+                    parts.append(f"# Now Playing (RPG)\n\nThe user is currently mid-campaign in "
+                                 f"**{_d.get('title', 'a story')}** (act {_d.get('act', 1)}). This is "
+                                 f"live ground truth from the story system — trust it over any recalled "
+                                 f"memory that seems to contradict it. You know where they are without "
+                                 f"them saying so, so 'ready to play tonight?' lands.\n\n---\n\n")
+    except Exception:
+        pass
+
+    # Seasons: while a quiet season is on, every context window carries the
+    # user's own definition of what their quiet means. The one-time courtesy
+    # note (they've been conversing 3+ days with the flag still on) is granted
+    # only on real user turns, never internal ones.
+    try:
+        from . import seasons as _seasons
+        _snote = _seasons.prompt_note()
+        if _snote:
+            parts.append(_snote)
+            if not getattr(_thread_ctx, "is_internal", False):
+                _courtesy = _seasons.courtesy_note_for_prompt()
+                if _courtesy:
+                    parts.append(_courtesy + "\n\n---\n\n")
+    except Exception:
+        pass
 
     system_content = "\n".join(parts)
     messages = state.get("messages", []) if isinstance(state, dict) else getattr(state, "messages", [])
@@ -793,7 +864,25 @@ def chat(
     channel_type: str | None = None,
     is_group_chat: bool = False,
     image_data_urls: list[str] | None = None,
+    channel_mode: str | None = None,
     ephemeral_context: str | None = None,
+    use_knowledge: bool = True,
+    knowledge_project: str | list[str] | None = None,
+    story_bank_id: str | None = None,
+    story_tag: str | None = None,
+    story_extra_tags: list[str] | None = None,
+    story_review=None,  # RPG goalie: callable(draft)->correction|None; one revision round
+    system_spine: str | None = None,  # RPG (S7): stable story layer (addendum+overlay+
+    #   instructions) appended to the END of the system message — cache-shaped: stable
+    #   prefix first, volatile last. Prompt-only, never persisted (like ephemeral_context).
+    ephemeral_tail: str | None = None,  # RPG (S7): volatile per-turn text (Director brief,
+    #   airtight note) appended AFTER the user's message — always at the very end of the
+    #   prompt, never mid-prompt. Prompt-only, never persisted.
+    mark_user_active: bool = True,  # False for attributed automated callers: the turn
+    #   persists under the caller's name but must NOT count as the user being live
+    #   (heartbeat skip window).
+    retain_extra_tags: list[str] | None = None,  # extra Hindsight tags for THIS exchange's
+    #   retention in the main bank (e.g. ["reflections"]) — additive.
 ) -> dict:
     """
     Send a message and get a response, with full conversation history from Postgres.
@@ -843,18 +932,79 @@ def chat(
     )
     history = _db_to_langchain(rows)
 
+    # RPG in-story auto-recall: story bank ONLY, filtered to this story's tag.
+    # Story banks never mix with main-chat recall (memory hygiene — the whole
+    # point of a separate bank). Best-effort; a down Hindsight degrades to none.
+    _recall_text = ""
+    if story_bank_id and channel_type != "internal":
+        _recall_query = (user_message or "").strip()[:300]
+        if _recall_query:
+            try:
+                _recall_text, _ = recall_with_privacy_flag(
+                    story_bank_id, _recall_query,
+                    tags=[story_tag] if story_tag else None,
+                    tags_match="all",
+                    exclude_private=False,
+                )
+            except Exception:
+                _recall_text = ""
+
+    # Knowledge RAG auto-recall (project-scoped, e.g. RPG lore): semantic +
+    # keyword search over the knowledge DB, injected as prompt-only context.
+    # Skipped when the knowledge DB isn't configured (KNOWLEDGE_DATABASE_URL).
+    _knowledge_context = ""
+    if use_knowledge and knowledge_project and channel_type != "internal":
+        try:
+            from .knowledge_db import is_configured as _kn_ok, search as _kn_search
+            _kn_query = (user_message or "").strip()[:300]
+            if _kn_query and _kn_ok():
+                _kn_results = _kn_search(
+                    query=_kn_query,
+                    project=knowledge_project,
+                    limit=4,
+                    access_level="admin",
+                )
+                if _kn_results:
+                    _kn_parts = ["## Relevant Knowledge (auto-retrieved)"]
+                    for r in _kn_results:
+                        _title = r.get("doc_title", "")
+                        _section = r.get("section_header", "")
+                        _proj = r.get("project", "")
+                        _kn_parts.append(
+                            f"[{_title} | {_section}{' | ' + _proj if _proj else ''}]\n"
+                            f"{r.get('content', '')}")
+                    _knowledge_context = "\n\n".join(_kn_parts)
+        except Exception as e:
+            logger.debug("Knowledge auto-recall failed (non-critical): %s", e)
+            _knowledge_context = ""
+
     # Add new user message.
     # Prefix with the current timestamp so it's visible right next to the content the
     # model responds to — the system prompt time is also there, but this is more salient.
     # The original user_message (without prefix) is what gets stored to DB and Hindsight.
     time_str = _format_current_time(current_time)
     _user_block = user_message if user_message else "[Image(s) attached]"
+    _body_lines: list[str] = [f"[{time_str}]"]
     if ephemeral_context and ephemeral_context.strip():
         # Prompt-only context (e.g. voice-mode / read-aloud addendum): the LLM sees
         # it this turn, but the stored message never includes it.
-        text_content = f"[{time_str}]\n\n{ephemeral_context.strip()}\n\n---\n\n{_user_block}"
+        _body_lines.append(ephemeral_context.strip())
+    if _recall_text and user_message:
+        _body_lines.append(
+            "## Recalled Memories (auto-injected — do not call hindsight_recall again "
+            "unless you need a different query)\n\n" + _recall_text
+        )
+    if _knowledge_context and user_message:
+        _body_lines.append(_knowledge_context)
+    if len(_body_lines) > 1:
+        _body_lines.append("---")
+        _body_lines.append(_user_block)
+        text_content = "\n\n".join(_body_lines)
     else:
         text_content = f"[{time_str}]\n{_user_block}"
+    if ephemeral_tail and ephemeral_tail.strip():
+        # RPG (S7): volatile scene direction lands at the very end of the prompt.
+        text_content = text_content + "\n\n" + ephemeral_tail.strip()
 
     if image_data_urls:
         # Multimodal: text + images for vision-capable models
@@ -879,6 +1029,18 @@ def chat(
         "channel_type": channel_type,
         "is_group_chat": is_group_chat,
     }
+
+    # Pass per-turn context via thread-local so _build_core_memory_prompt and
+    # tools can read it (LangGraph strips extra state keys before the prompt
+    # callable runs).
+    _thread_ctx.thread_id = thread_id  # tools read this (e.g. story_recall gates on rpg:*)
+    _thread_ctx.is_internal = (channel_type == "internal")  # Seasons courtesy gate
+    # RPG story spine (S7) — thread-id-guarded tuple so a stale value from an
+    # errored turn can never leak into another story on a reused worker thread.
+    # Left set through the goalie revision round (its second invoke rebuilds the
+    # system prompt too); cleared after the goalie block below.
+    _thread_ctx.rpg_spine = (thread_id, system_spine.strip()) if (
+        system_spine and system_spine.strip()) else None
 
     # Invoke agent with time-aware and identity-aware state
     try:
@@ -933,6 +1095,29 @@ def chat(
             ) from e
         raise
 
+    # Extract last AI response content (used for persist + retain).
+    last_ai = _get_last_ai_content(result["messages"])
+
+    # RPG goalie (mystery mode): the Director checks the draft against hidden
+    # truth BEFORE the player sees it. One revision round max. The correction
+    # directive is ephemeral — persistence below uses last_ai + user_message,
+    # never the message list, so the directive never enters thread history.
+    if story_review is not None and last_ai:
+        try:
+            _correction = story_review(last_ai)
+            if _correction:
+                _rev = HumanMessage(content=(
+                    "[Director correction — revise your narration to comply. Do not "
+                    "explain or acknowledge; reissue the corrected narration only.]\n"
+                    + _correction))
+                _res2 = agent.invoke({"messages": result["messages"] + [_rev]}, config=run_config)
+                _ai2 = _get_last_ai_content(_res2["messages"])
+                if _ai2:
+                    last_ai = _ai2
+        except Exception:
+            pass  # ship the original draft if revision fails
+    _thread_ctx.rpg_spine = None  # story spine done for this turn (S7)
+
     # Persist new messages (3-tuple: role, content, metadata; reasoning=None for live chat)
     # stored_message lets callers save an abbreviated version (e.g. "HEARTBEAT") while the
     # LLM still received the full user_message above.
@@ -940,7 +1125,6 @@ def chat(
     # can exclude both sides of the pair from regular conversation context.
     to_persist: list[tuple[str, str, dict | None, str | None]] = []
     to_persist.append(("user", stored_message or user_message, None, None))
-    last_ai = _get_last_ai_content(result["messages"])
     if last_ai:
         hb_meta = {"role_display": "heartbeat"} if user_display_name == "heartbeat" else None
         to_persist.append(("assistant", last_ai, hb_meta, None))
@@ -952,27 +1136,46 @@ def chat(
     )
 
     # Track when the user was last actively chatting so heartbeats can skip if they're live.
-    # Only update for real user interactions — not cron or heartbeat (channel_type="internal").
-    if channel_type != "internal":
+    # Only update for real user interactions — not cron or heartbeat (channel_type="internal")
+    # and not attributed automated callers (mark_user_active=False).
+    if channel_type != "internal" and mark_user_active:
         try:
             import time as _time
             LAST_ACTIVE_PATH.write_text(str(_time.time()))
         except Exception:
             pass  # Non-critical; never fail a chat over a missing file
+        # Seasons: a real user turn while a season is on feeds the conversing-
+        # streak tracker (for the one courtesy mention). It never ends the
+        # season — exit is the user's hand on the flag, only.
+        try:
+            from . import seasons as _seasons
+            _seasons.note_user_activity()
+        except Exception:
+            pass
 
     # Retain into Hindsight as lived experience — fire-and-forget background thread.
     # Running async avoids blocking the response for the ~5s Hindsight round-trip.
     # Daemon=True means the thread won't prevent process exit if it's still running.
+    # RPG story turns retain to the STORY bank tagged with the story (+ act),
+    # NEVER to the main bank — memory hygiene is the whole point.
+    if story_bank_id:
+        _retain_bank = story_bank_id
+        _retain_tags = [t for t in ([story_tag] + (story_extra_tags or [])) if t] or None
+    else:
+        _retain_bank = None  # uses HINDSIGHT_BANK_ID
+        _retain_tags = [t for t in (retain_extra_tags or []) if t] or None
     threading.Thread(
         target=retain_exchange,
         kwargs=dict(
-            bank_id=None,  # uses HINDSIGHT_BANK_ID
-            user_content=user_message,
+            bank_id=_retain_bank,
+            user_content=stored_message or user_message,
             assistant_content=last_ai,
             thread_id=thread_id,
             user_id=user_id,
+            user_display_name=user_display_name,
             channel_type=channel_type,
             is_group_chat=is_group_chat,
+            extra_tags=_retain_tags,
         ),
         daemon=True,
     ).start()

@@ -8,7 +8,7 @@ Uses pipecat's development runner, which serves the /start + /api/offer protocol
 the prebuilt Pipecat Playground UI (2.5.0) expects.
 
 Run:   .venv\Scripts\python echo_loop.py -t webrtc --port 8010
-Open:  http://localhost:8010  (optionally expose on your tailnet via
+Open:  http://localhost:8010  (optionally expose on your LAN/VPN via
        `tailscale serve` for phone access)
 """
 # IMPORTANT: torch first — its bundled cuDNN 9 / cuBLAS DLLs must be loaded

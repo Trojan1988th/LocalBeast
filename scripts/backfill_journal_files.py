@@ -32,7 +32,7 @@ load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=True)
 EST = ZoneInfo("America/New_York")
 
 # Default root folder — where the agent writes files
-DEFAULT_ROWAN_DIR = r"C:\Users\user\Documents\Ai Research\the agent"
+DEFAULT_JOURNAL_DIR = r"C:\path\to\your\journal\folder"
 
 # Subfolders to scan (relative to root)
 SCAN_SUBDIRS = ["reflections", "Journal", "research"]
@@ -111,13 +111,13 @@ def _get_local_conn():
     return psycopg.connect(url, row_factory=dict_row)
 
 
-def backfill(rowan_dir: str, dry_run: bool = False) -> None:
+def backfill(journal_dir: str, dry_run: bool = False) -> None:
     print(f"{'[DRY RUN] ' if dry_run else ''}Backfilling journal from local markdown files...")
-    print(f"  Root: {rowan_dir}\n")
+    print(f"  Root: {journal_dir}\n")
 
-    root = Path(rowan_dir)
+    root = Path(journal_dir)
     if not root.exists():
-        raise SystemExit(f"Directory not found: {rowan_dir}")
+        raise SystemExit(f"Directory not found: {journal_dir}")
 
     # Ensure schema
     if not dry_run:
@@ -205,7 +205,7 @@ def backfill(rowan_dir: str, dry_run: bool = False) -> None:
                         INSERT INTO journal_entries
                             (entry_date, entry_type, title, content, word_count,
                              source, metadata, created_at, updated_at)
-                        VALUES (%s, %s, %s, %s, %s, 'rowan', %s, %s, %s)
+                        VALUES (%s, %s, %s, %s, %s, 'agent', %s, %s, %s)
                         """,
                         (
                             edate, entry_type, title, content, wc,
@@ -236,8 +236,8 @@ if __name__ == "__main__":
     parser.add_argument("--dry-run", action="store_true", help="Preview without writing")
     parser.add_argument(
         "--dir",
-        default=DEFAULT_ROWAN_DIR,
-        help=f"Root folder to scan (default: {DEFAULT_ROWAN_DIR})",
+        default=DEFAULT_JOURNAL_DIR,
+        help=f"Root folder to scan (default: {DEFAULT_JOURNAL_DIR})",
     )
     args = parser.parse_args()
-    backfill(rowan_dir=args.dir, dry_run=args.dry_run)
+    backfill(journal_dir=args.dir, dry_run=args.dry_run)
